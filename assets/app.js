@@ -581,22 +581,20 @@ function editPerson(id, { asMe = false } = {}) {
     const el = document.elementFromPoint(e.clientX, e.clientY);
     return el && el.classList && el.classList.contains('c') && editor.contains(el) ? el : null;
   };
-  // Mouse: press and drag to paint. Touch: tap to toggle and swipe to scroll, unless
-  // "Drag to paint" is switched on (then swiping paints instead of scrolling).
+  // Mouse/pen: press and drag to paint. Touch: tap toggles a cell, a normal swipe scrolls,
+  // and press-and-hold then drag paints (like click-and-drag on a computer).
   const touchUI = window.matchMedia && matchMedia('(pointer: coarse)').matches;
-  let paintMode = !touchUI;
-  let handled = false;
-  editor.classList.toggle('painting', paintMode);
+  let suppressClickUntil = 0;
   editor.addEventListener('click', (e) => {
-    if (handled) { handled = false; return; }
+    if (Date.now() < suppressClickUntil) return;
     const c = e.target.closest && e.target.closest('.c');
     if (c) setCell(+c.dataset.wd, +c.dataset.j, !grid[+c.dataset.wd][+c.dataset.j]);
   });
   editor.addEventListener('pointerdown', (e) => {
-    if (e.pointerType !== 'mouse' && !paintMode) return;
+    if (e.pointerType === 'touch') return;
     const c = cellAt(e);
     if (!c) return;
-    handled = true;
+    suppressClickUntil = Date.now() + 60000;
     e.preventDefault();
     const wd = +c.dataset.wd; const j = +c.dataset.j;
     paint = !grid[wd][j];
@@ -604,35 +602,97 @@ function editPerson(id, { asMe = false } = {}) {
     editor.setPointerCapture(e.pointerId);
   });
   editor.addEventListener('pointermove', (e) => {
-    if (paint == null) return;
+    if (paint == null || e.pointerType === 'touch') return;
     const c = cellAt(e);
     if (c) setCell(+c.dataset.wd, +c.dataset.j, paint);
   });
-  const stop = () => { paint = null; };
+  const stop = (e) => {
+    if (e.pointerType === 'touch') return;
+    if (paint != null) suppressClickUntil = Date.now() + 50; // swallow the click that ends a drag
+    paint = null;
+  };
   editor.addEventListener('pointerup', stop);
   editor.addEventListener('pointercancel', stop);
 
+  const HOLD_MS = 300;
+  let hold = null; // { x, y, timer }
+  let touchPaint = false;
+  let autoScroll = 0;
+  let lastTouch = null;
+  const touchCell = (t) => {
+    const el = document.elementFromPoint(t.clientX, t.clientY);
+    return el && el.classList && el.classList.contains('c') && editor.contains(el) ? el : null;
+  };
+  const endTouch = () => {
+    if (hold) clearTimeout(hold.timer);
+    hold = null;
+    if (touchPaint) suppressClickUntil = Date.now() + 500;
+    touchPaint = false;
+    paint = null;
+    cancelAnimationFrame(autoScroll);
+    autoScroll = 0;
+    editor.classList.remove('touch-painting');
+  };
+  // Keep painting while the finger rests near the top or bottom edge of the scroll area.
+  const edgeScroll = () => {
+    if (!touchPaint || !lastTouch) { autoScroll = 0; return; }
+    const r = scroller.getBoundingClientRect();
+    const dy = lastTouch.clientY < r.top + 36 ? -8 : lastTouch.clientY > r.bottom - 36 ? 8 : 0;
+    if (dy) {
+      scroller.scrollTop += dy;
+      const c = touchCell(lastTouch);
+      if (c) setCell(+c.dataset.wd, +c.dataset.j, paint);
+    }
+    autoScroll = requestAnimationFrame(edgeScroll);
+  };
+  editor.addEventListener('touchstart', (e) => {
+    if (e.touches.length !== 1) { endTouch(); return; }
+    const t = e.touches[0];
+    const c = touchCell(t);
+    if (!c) return;
+    lastTouch = t;
+    hold = {
+      x: t.clientX,
+      y: t.clientY,
+      timer: setTimeout(() => {
+        const cell = touchCell(lastTouch) || c;
+        touchPaint = true;
+        paint = !grid[+cell.dataset.wd][+cell.dataset.j];
+        setCell(+cell.dataset.wd, +cell.dataset.j, paint);
+        editor.classList.add('touch-painting');
+        if (navigator.vibrate) { try { navigator.vibrate(12); } catch {} }
+        autoScroll = requestAnimationFrame(edgeScroll);
+      }, HOLD_MS),
+    };
+  }, { passive: true });
+  editor.addEventListener('touchmove', (e) => {
+    const t = e.touches[0];
+    lastTouch = t;
+    if (touchPaint) {
+      e.preventDefault(); // stop the page from scrolling while painting
+      const c = touchCell(t);
+      if (c) setCell(+c.dataset.wd, +c.dataset.j, paint);
+      return;
+    }
+    // Moved before the hold finished: it's a scroll, not a paint.
+    if (hold && Math.hypot(t.clientX - hold.x, t.clientY - hold.y) > 8) { clearTimeout(hold.timer); hold = null; }
+  }, { passive: false });
+  editor.addEventListener('touchend', endTouch);
+  editor.addEventListener('touchcancel', endTouch);
+  editor.addEventListener('contextmenu', (e) => e.preventDefault());
+
   const preset = (fn) => { fn(); redraw(); };
-  const paintBtn = touchUI ? h('button', {
-    type: 'button', class: 'sm', 'aria-pressed': 'false',
-    onclick: () => {
-      paintMode = !paintMode;
-      editor.classList.toggle('painting', paintMode);
-      paintBtn.setAttribute('aria-pressed', String(paintMode));
-      paintBtn.classList.toggle('primary', paintMode);
-      paintBtn.textContent = paintMode ? 'Drag to paint: on' : 'Drag to paint: off';
-      updateTzNote();
-    },
-  }, 'Drag to paint: off') : null;
-  const tools = h('div', { class: 'avail-tools' }, paintBtn,
+  const tools = h('div', { class: 'avail-tools' },
     h('button', { type: 'button', class: 'sm', onclick: () => preset(() => [1, 2, 3, 4, 5].forEach((wd) => { for (let j = 0; j < SLOTS; j++) grid[wd][j] = j >= 18 && j < 34; })) }, 'Weekdays 9–5'),
     h('button', { type: 'button', class: 'sm', onclick: () => preset(() => [2, 3, 4, 5].forEach((wd) => { grid[wd] = [...grid[1]]; })) }, 'Copy Monday to Tue–Fri'),
     h('button', { type: 'button', class: 'sm', onclick: () => preset(() => grid.forEach((col) => col.fill(false))) }, 'Clear all'));
   const scroller = h('div', { class: 'avail-scroll' }, editor);
   const tzNote = h('span', {});
   const updateTzNote = () => {
-    const how = !touchUI ? 'Click or drag to paint' : paintMode ? 'Drag to paint' : 'Tap to mark';
-    tzNote.textContent = `${how} the hours you're usually free, in ${tzIn.value.replace(/_/g, ' ')} time.`;
+    const how = touchUI
+      ? 'Tap to mark the hours you\'re usually free, or press and hold, then drag to paint several at once'
+      : 'Click or drag to paint the hours you\'re usually free';
+    tzNote.textContent = `${how}. Times are in ${tzIn.value.replace(/_/g, ' ')} time.`;
   };
   tzIn.addEventListener('change', updateTzNote);
   updateTzNote();
